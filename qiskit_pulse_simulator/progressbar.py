@@ -23,6 +23,7 @@ class NestedProgressBar:
             self.t_start = time.time()
         self._n.append(0)
         self._N.append(iterations)
+        self._print_status()
 
     def update(self, n):
         self._n[-1] = n
