@@ -53,7 +53,7 @@ class IBMQesquePulseSimulatorBackend(Backend):
             qubit_lo_freq: Optional[List[float]] = None,
             T1: Optional[List[float]] = None,
             T2: Optional[List[float]] = None,
-            lo_freq: Optional[float] = 3.5e9,
+            lo_freq: Optional[float] = None,
             bandwidth: Optional[float] = 2e9,
             dt: float = 1/4.5e9,
             stubs: Optional[dict] = None,
