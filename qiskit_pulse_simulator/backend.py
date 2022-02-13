@@ -3,6 +3,7 @@ from collections import defaultdict
 import copy
 from datetime import datetime
 from itertools import product
+from functools import partial
 from operator import attrgetter
 from typing import List, Optional, Sequence, Tuple, Union, overload
 import uuid
@@ -228,40 +229,41 @@ class IBMQesquePulseSimulatorBackend(Backend):
             shots=4000,
             meas_level=MeasLevel.CLASSIFIED,
             solver='sesolve',
-            nsteps=1000,
-            use_openmp=False,
+            nsteps=None,
+            use_openmp=None,
             progress_bar=True,
+            use_ipyparallel=False,
         )
 
     def run(self, run_input: Union[Runnable, Sequence[Runnable]], **options) -> Job:
         options = {**self.options.__dict__, **options}
+        use_ipyparallel = options.pop('use_ipyparallel', False)
 
         qobj = self._assemble(run_input, options)
         sims = self._create_simulator(qobj)
 
-        if options['progress_bar']:
-            progress_bar = NestedProgressBar("Circuit ({n}/{N})")
+        if use_ipyparallel is not None and use_ipyparallel is not False:
+            import ipyparallel as ipp
+
+            if isinstance(use_ipyparallel, ipp.Client):
+                client = use_ipyparallel
+            else:
+                if use_ipyparallel is True:
+                    client_kwargs = {}
+                elif isinstance(use_ipyparallel, dict):
+                    client_kwargs = use_ipyparallel
+                else:
+                    raise TypeError(type(use_ipyparallel))
+                client = ipp.Client(**client_kwargs)
+
+            runner = partial(self._run_sims_ipyparallel, client)
+        elif len(sims) >= 5:
+            runner = self._run_sims_parallel
         else:
-            progress_bar = None
+            runner = self._run_sims_serial
 
-        if len(sims) > 10:
-            all_data = qutip.parallel_map(
-                self._run_sim,
-                sims,
-                (options,),
-                progress_bar=progress_bar
-            )
-        else:
-            if progress_bar: progress_bar.start(len(sims))
-            all_data = []
-            for i, sim in enumerate(sims):
-                if progress_bar: progress_bar.update(i)
-                data = self._run_sim(sim, options, progress_bar=progress_bar)
-                all_data.append(data)
-            if progress_bar: progress_bar.finished()
-
-        del progress_bar
-
+        progress_bar = NestedProgressBar("Circuit ({n}/{N})") if options['progress_bar'] else None
+        all_data = runner(sims, options, progress_bar=progress_bar)
         result = self._format_result(qobj, all_data)
 
         job = StubJob(
@@ -446,15 +448,94 @@ class IBMQesquePulseSimulatorBackend(Backend):
 
         return generators
 
+    def _run_sims_serial(
+            self,
+            sims: Sequence[PulseSimulator],
+            options: dict,
+            *,
+            progress_bar=None,
+    ) -> dict:
+        all_data = []
+
+        if progress_bar: progress_bar.start(len(sims))
+
+        for i, sim in enumerate(sims):
+            if progress_bar: progress_bar.update(i)
+            data = self._run_sim(sim, options, progress_bar=progress_bar)
+            all_data.append(data)
+
+        if progress_bar: progress_bar.finished()
+
+        return all_data
+
+    def _run_sims_parallel(
+            self,
+            sims: Sequence[PulseSimulator],
+            options: dict,
+            *,
+            progress_bar=None,
+    ) -> dict:
+        options = options.copy()
+        use_openmp = options.get('use_openmp')
+        if use_openmp is None:
+            options['use_openmp'] = False
+
+        all_data = qutip.parallel_map(
+            self._run_sim,
+            sims,
+            (options,),
+            progress_bar=progress_bar
+        )
+
+        return all_data
+
+    def _run_sims_ipyparallel(
+            self,
+            client,
+            sims: Sequence[PulseSimulator],
+            options: dict,
+            *,
+            progress_bar=None,
+    ) -> dict:
+        import ipyparallel as ipp
+
+        options = options.copy()
+        use_openmp = options.get('use_openmp')
+        if use_openmp is None:
+            options['use_openmp'] = False
+
+        view = client.load_balanced_view()
+        it = view.imap(partial(self._run_sim, options=options), sims)
+
+        all_data = []
+
+        try:
+            if progress_bar: progress_bar.start(len(sims))
+            for data in it:
+                if progress_bar: progress_bar.update(len(all_data))
+                all_data.append(data)
+            if progress_bar: progress_bar.finished()
+        except KeyboardInterrupt:
+            it.cancel()
+            raise
+
+        return all_data
+
     @staticmethod
     def _run_sim(sim: PulseSimulator, options: dict, *, progress_bar=None) -> dict:
         solver = getattr(sim, options['solver'])
 
+        tlist = [0, sim.duration]
+        nsteps = options.get('nsteps')
+        if nsteps is None:
+            nsteps = np.mean(np.diff(tlist)) * 1000
+
         result = solver(
-            tlist=np.linspace(0, sim.duration, sim.duration+1),
+            tlist=[0, sim.duration],
             options=qutip.Options(
-                nsteps=options.get('nsteps'),
+                nsteps=nsteps,
                 use_openmp=options.get('use_openmp'),
+                openmp_threads=options.get('openmp_threads'),
             ),
             progress_bar=progress_bar,
         )
@@ -510,7 +591,6 @@ class IBMQesquePulseSimulatorBackend(Backend):
                 'status': 'DONE',
                 'header': qobj_exp.header.to_dict(),
             }
-
             if hasattr(qobj.config, 'meas_return'):
                 exp_result['meas_return'] = qobj.config.meas_return
 
