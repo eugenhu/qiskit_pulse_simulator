@@ -108,7 +108,7 @@ class PulseSimulator:
             progress_bar=True,
     ) -> qutip.solver.Result:
         if rho0 is None:
-            rho0 = qutip.basis(self.system.dims)
+            rho0 = qutip.fock_dm(self.system.dims)
 
         return self._solve(
             'mesolve',
