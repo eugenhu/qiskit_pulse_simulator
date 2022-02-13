@@ -136,6 +136,11 @@ class IBMQesquePulseSimulatorBackend(Backend):
             cmd_def: Optional[list] = None,
             properties: Optional[BackendProperties] = None,
     ) -> Tuple[PulseBackendConfiguration, PulseDefaults, BackendProperties]:
+        hamiltonian = self._hamiltonian.copy()
+
+        for k, v in hamiltonian['vars'].items():
+            hamiltonian['vars'][k] = v/1e9
+
         gates = gates or []
         basis_gates = list(map(attrgetter('name'), gates))
         n_uchannels = len(self._u_channel_lo)
@@ -184,7 +189,7 @@ class IBMQesquePulseSimulatorBackend(Backend):
             rep_times=[1000.0],
             meas_kernels=['hw_qmfk'],
             discriminators=['hw_qmfk'],
-            hamiltonian=self._hamiltonian,
+            hamiltonian=hamiltonian,
             meas_map=meas_map,
             credits_required=False,
             parametric_pulses=['gaussian', 'gaussian_square', 'drag', 'constant'],
