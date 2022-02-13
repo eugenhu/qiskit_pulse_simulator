@@ -561,6 +561,7 @@ class IBMQesquePulseSimulatorBackend(Backend):
 
         probs = defaultdict(int)
         for key, pval in pmf.items():
+            pval = abs(pval)  # just make sure it's not complex
             state = 0
             for i, n in enumerate(key):
                 c = reg_from_qubit.get(i)
