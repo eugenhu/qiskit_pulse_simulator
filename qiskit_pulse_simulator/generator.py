@@ -32,6 +32,10 @@ class Generator(ABC):
     @abstractmethod
     def compile(self, t0: Optional[int] = None, t1: Optional[int] = None) -> qutip.Cubic_Spline:
         ...
+        
+    @abstractmethod
+    def accumulated_phase(self, t: int) -> float:
+        ...
 
     @property
     @abstractmethod
@@ -177,6 +181,11 @@ class SimpleGenerator(Generator):
                 raise TypeError(type(inst))
 
         return out
+
+    def accumulated_phase(self, t: int) -> float:
+        phase = 2*np.pi * self.lo * t
+        phase += self._carrier_phase_mod(np.array([t]))[0]
+        return phase
 
     @property
     def duration(self) -> int:
