@@ -1,10 +1,12 @@
 from __future__ import annotations
+import cmath
 from collections import defaultdict
 import copy
 from datetime import datetime
-from itertools import product
 from functools import partial
+from itertools import product
 from operator import attrgetter
+import random
 from typing import List, Optional, Sequence, Tuple, Union, overload
 import uuid
 
@@ -14,6 +16,7 @@ from qiskit.circuit import QuantumCircuit
 from qiskit.providers import BackendPropertyError, BackendV1 as Backend, Options, JobV1 as Job
 from qiskit.providers.models import (
     BackendProperties,
+    Command,
     PulseBackendConfiguration,
     PulseDefaults,
     UchannelLO,
@@ -619,7 +622,14 @@ class IBMQesquePulseSimulatorBackend(Backend):
         return properties
 
     @classmethod
-    def from_backend(cls, backend: Backend) -> IBMQesquePulseSimulatorBackend:
+    def from_backend(
+            cls,
+            backend: Backend,
+            subsystem_list: Optional[list] = None,
+    ) -> IBMQesquePulseSimulatorBackend:
+        if subsystem_list is not None:
+            return cls._from_backend_with_subsystem_list(backend, subsystem_list)
+
         config = backend.configuration()
         defaults = backend.defaults()
         properties = backend.properties()
@@ -664,3 +674,189 @@ class IBMQesquePulseSimulatorBackend(Backend):
             T2=T2,
             stubs=stubs,
         )
+
+    @classmethod
+    def _from_backend_with_subsystem_list(
+            cls,
+            backend: Backend,
+            subsystem_list: list,
+    ) -> IBMQesquePulseSimulatorBackend:
+        # This function has assumptions on the form of the backend's Hamiltonian to isolate the specified
+        # subsystem.
+        config = backend.configuration()
+        defaults = backend.defaults()
+        properties = backend.properties()
+
+        if subsystem_list is None:
+            subsystem_list = list(range(config.n_qubits))
+
+        if len(set(subsystem_list)) < len(subsystem_list):
+            raise ValueError("subsystem_list contains duplicate qubits.")
+
+        n_qubits = len(subsystem_list)
+        hamiltonian = {
+            'h_str': [
+                '_SUM[i,0,' + str(n_qubits-1) + ',wq{i}/2*(I{i}-Z{i})]',
+                '_SUM[i,0,' + str(n_qubits-1) + ',delta{i}/2*O{i}*O{i}]',
+                '_SUM[i,0,' + str(n_qubits-1) + ',-delta{i}/2*O{i}]',
+                '_SUM[i,0,' + str(n_qubits-1) + ',omegad{i}*X{i}||D{i}]',
+            ],
+            'vars': {},
+            'qub': {},
+        }
+
+        for i, qubit in enumerate(subsystem_list):
+            wq = config.hamiltonian['vars'][f'wq{qubit}']
+            delta = config.hamiltonian['vars'][f'delta{qubit}']
+            omegad = config.hamiltonian['vars'][f'omegad{qubit}']
+            hamiltonian['vars'][f'wq{i}'] = wq
+            hamiltonian['vars'][f'delta{i}'] = delta
+            hamiltonian['vars'][f'omegad{i}'] = omegad
+            hamiltonian['qub'][i] = 3
+
+        new_coupling_map = []
+        new_u_channel_lo = []
+
+        for u_terms, (qubit_i, qubit_j) in zip(config.u_channel_lo, config.coupling_map):
+            if qubit_i not in subsystem_list or qubit_j not in subsystem_list:
+                continue
+
+            i = subsystem_list.index(qubit_i)
+            j = subsystem_list.index(qubit_j)
+            new_coupling_map.append([i, j])
+
+            jqq = config.hamiltonian['vars'].get(f'jq{qubit_i}q{qubit_j}')
+            if jqq is not None:
+                hamiltonian['vars'][f'jq{i}q{j}'] = jqq
+                hamiltonian['h_str'].extend([
+                    f'jq{i}q{j}*Sp{i}*Sm{j}',
+                    f'jq{i}q{j}*Sm{j}*Sp{i}',
+                ])
+
+            new_u_terms = []
+            for u_term in u_terms:
+                if isinstance(u_term, dict):
+                    u_term = UchannelLO.from_dict(u_term)
+                if u_term.q not in subsystem_list:
+                    continue
+                new_q = subsystem_list.index(u_term.q)
+                scale = u_term.scale
+                if isinstance(scale, tuple):
+                    scale = scale[0] + 1j*scale[1]
+                u_term = UchannelLO(new_q, scale)
+                new_u_terms.append(u_term)
+
+            target = max(new_u_terms, key=lambda x: x.scale.real).q
+            control = i if target == j else j
+            hamiltonian['h_str'].append(
+                f'omegad{target}*X{control}||U{len(new_u_channel_lo)}',
+            )
+            new_u_channel_lo.append(new_u_terms)
+
+        T1 = None
+        T2 = None
+
+        if properties is not None:
+            try:
+                T1 = [properties.qubit_property(qubit, 'T1')[0] for qubit in subsystem_list]
+            except BackendPropertyError:
+                pass
+            try:
+                T2 = [properties.qubit_property(qubit, 'T2')[0] for qubit in subsystem_list]
+            except BackendPropertyError:
+                pass
+
+        cmd_def = fake_measure_cmd_def(list(range(n_qubits)))
+
+        new_qubit_freq_est = [
+            defaults.qubit_freq_est[qubit]
+            for qubit in subsystem_list
+        ]
+
+        new_meas_freq_est = [
+            defaults.meas_freq_est[qubit]
+            for qubit in subsystem_list
+        ]
+
+        new_meas_map = dict()
+        for group in config.meas_map:
+            new_group = []
+            for qubit in group:
+                if qubit not in subsystem_list:
+                    continue
+                new_group.append(subsystem_list.index(qubit))
+            if len(new_group) == 0:
+                continue
+            new_meas_map[tuple(new_group)] = None
+        new_meas_map = list(map(list, new_meas_map.keys()))
+
+        stubs = {
+            'backend_name': config.backend_name + '_simulator',
+            'coupling_map': new_coupling_map,
+            'cmd_def': cmd_def,
+            'qubit_freq_est': new_qubit_freq_est,
+            'meas_freq_est': new_meas_freq_est,
+            'qubit_lo_range': config.qubit_lo_range,
+            'meas_lo_range': config.meas_lo_range,
+            'meas_map': new_meas_map,
+        }
+
+        return cls(
+            hamiltonian,
+            new_u_channel_lo,
+            qubit_lo_freq=new_qubit_freq_est,
+            T1=T1,
+            T2=T2,
+            stubs=stubs,
+        )
+
+
+def fake_measure_cmd_def(qubits: Sequence[int]) -> List[Command]:
+    """Generate fake measure command definitions for `qubits`."""
+    cmd_def = []
+    for qubit in qubits:
+        amp = cmath.rect(.25 + .1*random.random(), 2*np.pi*random.random())
+        cmd_def.append({
+            'name': 'measure',
+            'qubits': [qubit],
+            'sequence': [
+                {'name': 'parametric_pulse',
+                 't0': 0,
+                 'ch': f'm{qubit}',
+                 'label': f'M_m{qubit}',
+                 'pulse_shape': 'gaussian_square',
+                 'parameters': {'amp': amp,
+                                'duration': 1792,
+                                'sigma': 64,
+                                'width': 1536}},
+                {'name': 'delay', 't0': 1792, 'ch': f'm{qubit}', 'duration': 1376},
+                {'name': 'acquire',
+                 't0': 0,
+                 'duration': 1792,
+                 'qubits': [qubit],
+                 'memory_slot': [qubit]},
+            ]
+        })
+
+    measure_all = {
+        'name': 'measure',
+        'qubits': list(qubits),
+        'sequence': []
+    }
+
+    for cmd in cmd_def:
+        measure_all['sequence'].extend(copy.deepcopy(cmd['sequence'][:2]))
+
+    measure_all['sequence'].append({
+        'name': 'acquire',
+        't0': 0,
+        'duration': 1792,
+        'qubits': list(qubits),
+        'memory_slot': list(qubits),
+    })
+
+    cmd_def.append(measure_all)
+
+    cmd_def = list(map(Command.from_dict, cmd_def))
+
+    return cmd_def
